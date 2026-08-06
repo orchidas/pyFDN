@@ -32,7 +32,12 @@ def _():
                                         )
     from pyFDN.auxiliary.physics_based_coupling import (make_beta, make_gamma, make_Q,
                                                         trajectory, trajectory_with_delays,
-                                                        make_theta, make_K, get_decay_matrix, get_feedback_matrix,
+                                                        make_theta, make_K,
+                                                        get_spatial_kernel_matrix_and_delays_for_diffusion,
+                                                        get_spatio_temporal_decay_rates,
+                                                        get_diffusion_update_matrices,
+                                                        get_decay_matrix, get_feedback_matrix, get_diffusion_trajectory,
+                                                        get_fdn_parameters_from_diffusion,
                                                         run_gfdn, gfdn_ledger, room_energy_ledger_from_rirs)
 
     from multislope import DecayFitNet
@@ -56,10 +61,16 @@ def _():
         find_room,
         get_aperture_form_factor,
         get_decay_matrix,
+        get_diffusion_trajectory,
+        get_diffusion_update_matrices,
+        get_fdn_parameters_from_diffusion,
         get_feedback_matrix,
         get_point_to_room_weights,
         get_room_absorptive_area,
+        get_room_surface_area,
         get_room_volume,
+        get_spatial_kernel_matrix_and_delays_for_diffusion,
+        get_spatio_temporal_decay_rates,
         gfdn_ledger,
         least_squares,
         make_K,
@@ -397,6 +408,7 @@ def _(
     aperture_13_area,
     get_aperture_form_factor,
     get_room_absorptive_area,
+    get_room_surface_area,
     get_room_volume,
     make_Q,
     make_beta,
@@ -415,12 +427,14 @@ def _(
         S = np.array([[0, aperture_12_area, aperture_13_area], [aperture_12_area, 0, 0], [aperture_13_area, 0, 0]])
 
     V = np.array([get_room_volume(ROOM1_DIMS), get_room_volume(ROOM2_DIMS), get_room_volume(ROOM3_DIMS)])
+    surface_area = np.array([get_room_surface_area(ROOM1_DIMS), get_room_surface_area(ROOM2_DIMS), get_room_surface_area(ROOM3_DIMS)])
     absorp_area = np.array([get_room_absorptive_area(ROOM1_DIMS, ROOM1_ABS), get_room_absorptive_area(ROOM2_DIMS, ROOM2_ABS), get_room_absorptive_area(ROOM3_DIMS, ROOM3_ABS)])
     num_rooms = 3
 
     beta = make_beta(S, V)
     gamma = make_gamma(absorp_area, V)
     Q = make_Q(beta)
+
 
     mo.md(rf"""
     ### Physical generators
@@ -434,9 +448,12 @@ def _(
     Both have zero column sums (pure exchange, no absorption in this notebook) and are reversible w.r.t.
     $\pi_i\propto V_i$ — target long‑run split $V_1{{:}}V_2{{:}}V_3 = {V[0]:.0f}{{:}}{V[1]:.0f}{{:}}{V[2]:.0f}$.
 
-    $$\mathbf \Gamma = \begin{{pmatrix}}{gamma[0,0]:.4f}&{gamma[0,1]:.4f}&{gamma[0, 2]:.4f}\\{gamma[1,0]:.4f}&{gamma[1,1]:.4f}&{gamma[1,2]:.4f}\\{gamma[2,0]:.4f}&{gamma[2,1]:.4f}&{gamma[2, 2]:.4f}\end{{pmatrix}}\ \mathrm{{s}}^{{-1}}$$
+    $$ \mathbf \Gamma = \begin{{pmatrix}}{gamma[0,0]:.4f}&{gamma[0,1]:.4f}&{gamma[0, 2]:.4f}\\{gamma[1,0]:.4f}&{gamma[1,1]:.4f}&{gamma[1,2]:.4f}\\{gamma[2,0]:.4f}&{gamma[2,1]:.4f}&{gamma[2, 2]:.4f}\end{{pmatrix}}\ \mathrm{{s}}^{{-1}}. $$
+
+    The individual room T60s are {np.round(np.log(1e-6) / -np.diag(gamma), 3)}s
+
     """)
-    return Q, V, beta, gamma, num_rooms
+    return Q, V, absorp_area, beta, gamma, num_rooms, surface_area
 
 
 @app.cell
@@ -663,7 +680,7 @@ def _(
     Emarkov_src_rec_new = Emarkov_src_rec_new.squeeze()
     new_common_t60= np.log(1e-6) / new_common_decay
 
-    # trajectory independent of source and receiver position
+    # trajectory independent of source and receiver weights. Source in room 2 and receivers in all three rooms.
     _, Emarkov_lossy_new = trajectory(Q, np.array([0, 1, 0]), np.eye(num_rooms), fs, n_samp, gamma_c)
 
     mo.md(rf"""
@@ -868,6 +885,72 @@ def _(
     return Y_src_rec, num_rec
 
 
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## Acoustic Diffusion equation
+
+    Let us try to find the energy trajectory using an approximate solution to the acoustic diffusion equation
+    """)
+    return
+
+
+@app.cell
+def _(
+    SOURCE_POS,
+    V,
+    absorp_area,
+    apertures,
+    fs,
+    get_diffusion_trajectory,
+    get_diffusion_update_matrices,
+    get_fdn_parameters_from_diffusion,
+    get_spatial_kernel_matrix_and_delays_for_diffusion,
+    get_spatio_temporal_decay_rates,
+    mo,
+    n_samp,
+    np,
+    rec_pos,
+    run_gfdn,
+    src_room,
+    surface_area,
+):
+    # get the temporal and spatial decay rates
+    sigma, epsilon = get_spatio_temporal_decay_rates(surface_area, absorp_area, V)
+
+    # get the kernel matrix
+    aperture_centroids = np.asarray([aperture.centroid for aperture in apertures])
+    spatial_kernel, delay_matrix = get_spatial_kernel_matrix_and_delays_for_diffusion(SOURCE_POS, src_room[0], 
+                                                                                      rec_pos, aperture_centroids, 
+                                                                                      epsilon, fs)
+    # note that sigma and expm(-gamma \Delta t) are same
+    diffuse_to_stat_ratio = 0.
+    spatial_kernel_final, Sigma = get_diffusion_update_matrices(spatial_kernel, sigma, diffuse_to_stat_ratio, fs)
+
+    # this is the stationary distribution from CM equations
+    init_energy_state = np.array(V / np.sum(V))
+    # trajectory according to diffusion
+    Ediff_src_rec, _ = get_diffusion_trajectory(spatial_kernel_final, Sigma, delay_matrix, init_energy_state, n_samp)
+
+    # trajectory according to GFDN
+    delays_diff, A_diff, B_diff, C_diff = get_fdn_parameters_from_diffusion(spatial_kernel_final, sigma, delay_matrix, fs)
+    Y_diff_src_rec = run_gfdn(A_diff, B_diff, C_diff, delays_diff, n_samp, input_state=init_energy_state)
+
+    mo.md(rf"""### Get equivalent FDN that reproduces diffusion trajectory
+
+    The individual T60s obtained from the ADE are {np.round(np.log(1e-6) / -sigma, 3)}s. These are fundamentally different from what is predicted by Cremer-Muller and obtained from common slopes analysis. The coupling is completely missing in this approach!
+    """)
+    return Ediff_src_rec, Y_diff_src_rec
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ### Plot the per-room energy trajectories
+    """)
+    return
+
+
 @app.cell
 def _(
     E_ex_lossy,
@@ -942,7 +1025,9 @@ def _(mo):
 
 @app.cell
 def _(
+    Ediff_src_rec,
     Emarkov_src_rec_new,
+    Y_diff_src_rec,
     Y_src_rec,
     butter,
     db,
@@ -978,6 +1063,7 @@ def _(
     _ref_rirs = sosfilt(_highpass_sos, sel_rirs[rec_idx], axis=-1)
     edc_ref = pyFDN.auxiliary.acoustics.edc(_ref_rirs[:,_start_time:_nmax], axis=-1, normalize=True)
     edc_fdn = pyFDN.auxiliary.acoustics.edc(Y_src_rec[:,_start_time:_nmax, :].squeeze(), axis=0, normalize=True)
+    edc_fdn_diff = pyFDN.auxiliary.acoustics.edc(Y_diff_src_rec[_start_time:_nmax, :], axis=0, normalize=True)
 
     # shape noise to generate RIR from Markov ledger
     noise = np.random.normal(0, 1.0, n_samp)
@@ -985,17 +1071,22 @@ def _(
     rir_markov = np.einsum('tk, t -> tk', np.sqrt(Emarkov_src_rec_new), noise)
     edc_markov = pyFDN.auxiliary.acoustics.edc(rir_markov, axis=0, normalize=True)
 
+    rir_diffusion = np.einsum('kt, t -> tk', np.sqrt(Ediff_src_rec), noise)
+    edc_diffusion = pyFDN.auxiliary.acoustics.edc(rir_diffusion, axis=0, normalize=True)
+
     for _rec, _ax in zip(range(len(rec_pos)), _axs):
         _ax.plot(tsec[_start_time:_nmax] * 1000, db(edc_ref[_rec, :]), lw=1.0, color="C0")
         _ax.plot(tsec[:_nmax] * 1000, db(edc_markov[:, _rec]), lw=1.0, color="C2")
-        _ax.plot(tsec[_start_time:_nmax] * 1000, db(edc_fdn[:, _rec]), lw=1.0, color="C3")
+        _ax.plot(tsec[:_nmax] * 1000, db(edc_diffusion[:, _rec]), lw=1.0, color="C3")
+        _ax.plot(tsec[_start_time:_nmax] * 1000, db(edc_fdn[:, _rec]), lw=1.0, color="C4")
+        _ax.plot(tsec[_start_time:_nmax] * 1000, db(edc_fdn_diff[:, _rec]), lw=1.0, color="C5")
         _ax.set_title(f"receiver:{np.round(sel_rec[rec_idx[_rec]], 2)}", fontsize=9)
         _ax.set_xlabel("time (ms)")
         _ax.set_ylabel("$EDC (db)$")
         _ax.grid(True, alpha=0.3)
 
     _axs[0].set_ylim(-60, 10)
-    _axs[0].legend(['Reference', 'Cremer-Muller', 'GFDN'])
+    _axs[0].legend(['Reference', 'Cremer-Muller', 'Acoustic diffusion', 'GFDN from SA', 'GFDN from ADE'])
     _fig.tight_layout()
     mo.mpl.interactive(_fig)
     return

@@ -223,12 +223,162 @@ def get_feedback_matrix(R_room: NDArray,
         return D @ R_room_lift @ np.linalg.inv(D) @ Qblocks
 
 
-def run_gfdn(A,
+def get_spatio_temporal_decay_rates(
+        surface_area: List,
+        absorp_area: List,
+        volume: List,
+        c: float = 343) -> Tuple[ArrayLike, ArrayLike]:
+    """
+    Get the spatial decay and temporal decay rates based on acoustic diffusion equation.
+    Returns:
+        Tuple[ArrayLike, ArrayLike]: temporal and spatial decay rates
+    """
+    diffusion_coeff = (4 * volume * c) / (3 * surface_area)
+    temporal_decay = (absorp_area * c) / (4 * volume)
+    spatial_decay = np.sqrt(temporal_decay / diffusion_coeff)
+    return temporal_decay, spatial_decay
+
+
+def get_spatial_kernel_matrix_and_delays_for_diffusion(
+        source_pos: List,
+        source_room: int,
+        rec_pos: NDArray,
+        aperture_centroids: NDArray,
+        epsilon: ArrayLike,
+        fs: float,
+        c: float = 343) -> Tuple[NDArray, NDArray]:
+    """
+    Get spatial kernel matrix and delay matrix for solving the ADE.
+    Args:
+        source_pos (List): single source position coordinates
+        source_room (int): which room is the source in
+        rec_pos (NDArray): list of receiver positions, of size num_receivers x 3
+        aperture_centroids (NDArray): list of aperture centroids, of size num_apertures x 3
+        epsilon (ArrayLike): list of spatial decay rates of size num_rooms
+        fs (float): sampling frequency
+        c (float): speed of sound
+    Returns:
+        NDArray, NDArray: the spatial kernel matrix and appropriate delays of shape num_receivers x num_rooms
+    """
+    num_rooms = len(epsilon)
+    assert aperture_centroids.shape[
+        0] == num_rooms - 1, "Number of apertures must be one less than number of rooms"
+    assert source_room > 0 and source_room < num_rooms
+    num_rec = rec_pos.shape[0]
+    src_aperture_pos = np.insert(aperture_centroids,
+                                 source_room,
+                                 source_pos,
+                                 axis=0)
+
+    kernel_matrix = np.zeros((num_rec, num_rooms), dtype=np.float64)
+    # Calculate the Euclidean distance matrix of shape (num_rec, num_rooms)
+    distance_matrix = np.linalg.norm(rec_pos[:, np.newaxis, :] -
+                                     src_aperture_pos,
+                                     axis=2)
+    epsilon_expanded = np.ones((num_rec, 1)) @ epsilon[np.newaxis, :]
+    # element-wise operation
+    spatial_kernel = np.exp(
+        -epsilon_expanded * distance_matrix) / distance_matrix
+    delay_samples = np.rint(distance_matrix / c * fs).astype(int)
+    return spatial_kernel, delay_samples
+
+
+def get_diffusion_update_matrices(kernel_matrix: NDArray, sigma: ArrayLike,
+                                  diffuse_to_stat_ratio: float,
+                                  fs: float) -> Tuple[NDArray, NDArray]:
+    r"""
+    Return the diffusion update matrices, M(r) and Sigma
+    Args:
+        kernel_matrix (NDArray): kernel matrix of shape num_receivers x num_rooms
+        sigma (ArrayLike): temporal decay rates
+        diffusion_to_stat_ratio (float): diffusion to statistical acoustics ratio, 
+                                         also the spatial to temporal ratio
+        fs (float): sampling frequency
+    Returns:
+        Tuple[NDArray, NDArray]: returns the diffusion time update matrices, M(r),Sigma
+    """
+    delta_t = 1.0 / fs
+    a = diffuse_to_stat_ratio / (1.0 + diffuse_to_stat_ratio)
+    b = 1.0 / (1.0 + diffuse_to_stat_ratio)
+
+    Sigma = np.diag(np.exp(-sigma * delta_t))
+    M = a * kernel_matrix + b * np.ones_like(kernel_matrix)
+    return M, Sigma
+
+
+def get_diffusion_trajectory(M: NDArray, Sigma: NDArray,
+                             delay_samples: NDArray, init_state: ArrayLike,
+                             nsamp: int):
+    """
+    Get the time trajectory obtained from approximate solution to acoustic diffusion equation
+    Args:
+        M (NDArray): spatial kernel matrix, aK(r) + b
+        Sigma (NDArray): time update diagonal matrix
+        delay_samples (NDArray): delay matrix, sampe size as spatial kernel matrix
+        init_state: initial energy state of all receivers, shape num_receivers x 1
+        nsamp (int): number of samples for which to calculate trajectory
+    Returns:
+        NDArray, NDArray: the time domain energy trajectory of size num_receivers x nsamp
+    """
+    num_receivers = M.shape[0]
+    num_rooms = Sigma.shape[0]
+    room_energy = np.zeros((num_rooms, nsamp))
+    room_energy[:, 0] = init_state
+
+    # update room energies
+    for n in range(1, nsamp):
+        room_energy[:, n] = Sigma @ room_energy[:, n - 1]
+
+    #update receiver energies
+    receiver_energy = np.zeros((num_receivers, nsamp))
+
+    for r in range(num_receivers):
+        for j in range(num_rooms):
+            d = delay_samples[r, j]
+            receiver_energy[r, d:] += (M[r, j] * room_energy[j, :nsamp - d])
+    return receiver_energy, room_energy
+
+
+def get_fdn_parameters_from_diffusion(M: NDArray, sigma: ArrayLike,
+                                      delay_matrix: NDArray, fs: float):
+    """
+    Get unit delay FDN parameters to reproduce the acoustic diffusion equation
+    Returns:
+        Tuple[ArrayLike, NDArray,NDArray, NDArray]: FDN delays, feedback matrix, input and output gains
+    """
+    # note the vec operation is not same as ravel, that does row major ordering
+    # = K
+    num_rooms = len(sigma)
+    # = N
+    num_rec = M.shape[0]
+    assert len(sigma) == num_rooms
+    assert delay_matrix.shape == (num_rec, num_rooms)
+    # of len NK
+    delays = np.ravel(delay_matrix, order="F")
+
+    # fill diagonal matrix
+    # adjust decay to match clocks
+    diag_values = np.zeros(int(num_rec * num_rooms))
+    count = 0
+    for k in range(num_rec):
+        for j in range(num_rooms):
+            diag_values[count] = np.exp(-sigma[j] * delay_matrix[k, j] /
+                                        (2 * fs))
+            count += 1
+    A = np.diag(diag_values)
+    B = np.kron(np.eye(num_rooms), np.ones((num_rec, 1)))
+    M_flat = np.ravel(M, order="F")
+    C = np.kron(np.ones((1, num_rooms)), np.eye(num_rec)) @ np.diag(M_flat)
+    return delays, A, B, C
+
+
+def run_gfdn(A: NDArray,
              _B: NDArray,
              _C: NDArray,
              delays: ArrayLike,
              n_samp: int,
              _src: Union[int, List] = 0,
+             input_state: Optional[ArrayLike] = None,
              tv_matrix: Optional[TimeVaryingMatrix] = None):
     """
     Generic wrapper around process_fdn.
@@ -239,6 +389,7 @@ def run_gfdn(A,
         delays (ArrayLike): delay line lengths in samples
         _src (int, list): room where the source is
         n_samp (int): number of time samples
+        input_state (Arraylike, optional): if input state is already provided, of size num_inputs
         tv_matrix (Optional): if using a time varying matrix for increased mixing
     Returns:
         NDArray : GFDN output of size (num_inputs, n_samp, num_outputs)
@@ -248,20 +399,33 @@ def run_gfdn(A,
     num_outputs = _C.shape[0]
 
     Y = np.zeros((num_inputs, n_samp, num_outputs))
-    for n_src in range(num_inputs):
-        x = np.zeros((n_samp, num_inputs))
-        k = _src[n_src] if isinstance(_src, list) else _src
-        x[0, k] = 1.0
+    if input_state is None:
+        for n_src in range(num_inputs):
+            x = np.zeros((n_samp, num_inputs))
+            k = _src[n_src] if isinstance(_src, list) else _src
+            x[0, k] = 1.0
 
-        Y[n_src] = pyFDN.process_fdn(
+            Y[n_src] = pyFDN.process_fdn(
+                x,
+                delays,
+                A,
+                _B,
+                _C,
+                np.zeros((num_outputs, num_inputs)),
+                post_matrix=tv_matrix,
+            )
+    else:
+        x = np.zeros((n_samp, num_inputs))
+        x[0, :] = input_state
+        Y = pyFDN.process_fdn(
             x,
             delays,
             A,
             _B,
             _C,
             np.zeros((num_outputs, num_inputs)),
-            extra_matrix=tv_matrix,
         )
+
     return Y
 
 
