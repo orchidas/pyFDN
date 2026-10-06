@@ -10,7 +10,7 @@ def _():
     import numpy as np
     import matplotlib.pyplot as plt
 
-    from numpy.typing import NDArray
+    from numpy.typing import NDArray, ArrayLike
     from scipy.linalg import block_diag, expm
     from tqdm import tqdm
 
@@ -24,6 +24,7 @@ def _():
 
 
     return (
+        ArrayLike,
         NDArray,
         TimeVaryingMatrix,
         block_diag,
@@ -202,8 +203,8 @@ def _(NDArray, Nper, V, avg_delays, mo, np, num_rooms, pyFDN):
     def sample_delay_line_lengths(avg_tau: float, num_del_per_group:int) -> NDArray:
         """Sample co-prime delay line lengths according to the volume ratio"""
         gscale = V / V[0]
-        delay_min = 0.9 * avg_tau
-        delay_max = 1.1 * avg_tau
+        delay_min = 0.5 * avg_tau
+        delay_max = 1.5 * avg_tau
         delays = []
 
         for _i in range(num_rooms):
@@ -616,7 +617,7 @@ def _(E_ex_chain, E_ex_complete, Eref_chain, Eref_complete, fs, np, num_rooms):
             print(f'Cur reference time constant for room {_r+1} is {tau_ref[_r]:.3f}s')
             tau_gfdn[_r] = calculate_time_constant(_Eref[:, _r], fs, is_rising)
             print(f'Cur GFDN time constant for room {_r+1} is {tau_gfdn[_r]:.3f}s')
-    return
+    return (calculate_time_constant,)
 
 
 @app.cell
@@ -790,121 +791,173 @@ def _(
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    ### Sweep over different delay line lengths and numbers and plot the energy distribution histograms
+    ### Sweep over different delay line lengths and numbers and plot the energy distribution histograms and calculate mean trajectory deviation errors
     """)
     return
 
 
 @app.cell
 def _(
+    ArrayLike,
     NDArray,
-    Y_chain,
-    avg_delays,
     beta_chain,
+    beta_complete,
     block_diag,
+    calculate_time_constant,
     db,
-    delays,
     dur,
     expm,
-    fig_path,
     fs,
     get_coupling_angles,
     get_coupling_matrix,
     get_feedback_matrix,
-    mo,
+    gfdn_energy_ledger,
     np,
     num_rooms,
-    plt,
     pyFDN,
     run_gfdn,
     sample_delay_line_lengths,
 ):
-    def run_chain_for_Nroom(_avg_tau: float, _Nroom: int) -> NDArray:
-            N1 = N2 = N3 = _Nroom
-            Ntot = num_rooms * _Nroom
+    def run_gfdn_for_Nroom(_avg_tau: float, _Nroom: int, use_chain_topology:bool=True) -> NDArray:
+        """Run GFDN for different delay line lengths and numbers"""
+    
+        N1 = N2 = N3 = _Nroom
+        Ntot = num_rooms * _Nroom
 
-            # ------------------------------------------------------------
-            # Delay lengths
-            # -----------------------------------------------------------
-            delays = sample_delay_line_lengths(_avg_tau, _Nroom)
+        # ------------------------------------------------------------
+        # Delay lengths
+        # -----------------------------------------------------------
+        delays = sample_delay_line_lengths(_avg_tau, _Nroom)
 
-            M = np.array([
-                delays[:N1].sum(),
-                delays[N1:N1 + N2].sum(),
-                delays[N1 + N2:].sum(),
-            ])
+        M = np.array([
+            delays[:N1].sum(),
+            delays[N1:N1 + N2].sum(),
+            delays[N1 + N2:].sum(),
+        ])
 
-            dt_i = M / (_Nroom * fs)
+        dt_i = M / (_Nroom * fs)
 
-            # ------------------------------------------------------------
-            # Coupling matrix
-            # ------------------------------------------------------------
-            theta_chain = get_coupling_angles(beta_chain, dt_i)
-            K_chain = get_coupling_matrix(theta_chain)
-            R_room_chain = expm(K_chain)
+        # ------------------------------------------------------------
+        # Coupling matrix
+        # ------------------------------------------------------------
+        if use_chain_topology:
+            theta = get_coupling_angles(beta_chain, dt_i)
+        else:
+            theta = get_coupling_angles(beta_complete, dt_i)
+        K = get_coupling_matrix(theta)
+        R_room = expm(K)
 
-            # ------------------------------------------------------------
-            # Internal room mixers
-            # ------------------------------------------------------------
-            np.random.seed(1)
+        # ------------------------------------------------------------
+        # Internal room mixers
+        # ------------------------------------------------------------
+        np.random.seed(1)
 
-            Qblocks = block_diag(
-                pyFDN.random_orthogonal(N1),
-                pyFDN.random_orthogonal(N2),
-                pyFDN.random_orthogonal(N3),
-            )
+        Qblocks = block_diag(
+            pyFDN.random_orthogonal(N1),
+            pyFDN.random_orthogonal(N2),
+            pyFDN.random_orthogonal(N3),
+        )
 
-            A_chain = get_feedback_matrix(
-                R_room_chain,
-                Qblocks,
-                _Nroom,
-            )
+        A = get_feedback_matrix(
+            R_room,
+            Qblocks,
+            _Nroom,
+        )
 
-            # ------------------------------------------------------------
-            # Input
-            # ------------------------------------------------------------
-            B = np.zeros((Ntot, num_rooms))
+        # ------------------------------------------------------------
+        # Input
+        # ------------------------------------------------------------
+        B = np.zeros((Ntot, num_rooms))
 
-            B[:N1, 0] = 1.0 / np.sqrt(N1)
-            B[N1:N1 + N2, 1] = 1.0 / np.sqrt(N2)
-            B[N1 + N2:, 2] = 1.0 / np.sqrt(N3)
+        B[:N1, 0] = 1.0 / np.sqrt(N1)
+        B[N1:N1 + N2, 1] = 1.0 / np.sqrt(N2)
+        B[N1 + N2:, 2] = 1.0 / np.sqrt(N3)
 
-            C_lines = np.eye(Ntot)
-            n_samp = int(dur.value * fs)
+        C_lines = np.eye(Ntot)
+        n_samp = int(dur.value * fs)
 
-            Y_chain = run_gfdn(
-                A_chain,
-                B,
-                C_lines,
-                delays,
-                n_samp,
-                src=0,
-            )
+        Y = run_gfdn(
+            A,
+            B,
+            C_lines,
+            delays,
+            n_samp,
+            src=0,
+        )
 
-            return Y_chain, delays
+        return Y, delays
+
+    def get_energy_error(_Y:NDArray, _delays: ArrayLike, _Nroom:int, 
+                         _tau_avg:float,  Eref: NDArray, _src:int=0,
+                        _use_transient_calc: bool = False):
+        """Calculate the MAE between the GFDN trajectory and Markov trajectory (Eref)"""
+    
+        _E_ex, _n_ex = gfdn_energy_ledger(_Y, num_rooms, _Nroom, _delays)
+        _tail = slice(int(0.85 * _n_ex), _n_ex)
+
+        if _use_transient_calc:
+            _mae_transient = np.zeros(num_rooms, dtype=np.float32)
+            for _k in range(num_rooms):
+                _transient_start_time = calculate_time_constant(_E_ex[_src, :_n_ex, _k], fs, is_rising=_k!=0)
+                _transient_start_samp = int(_transient_start_time * fs)
+                _transient_ind = slice(0, _transient_start_samp)
+                _err_transient = _E_ex[_src, _transient_ind, _k] - Eref[_transient_ind, _k]
+                _mae_transient[_k] = db(np.mean(np.abs(_err_transient)))
+        else:
+            _transient_ind = slice(0, int(0.2 * fs))
+            _err_transient = _E_ex[_src, _transient_ind] - Eref[_transient_ind]
+            _mae_transient = db(np.mean(np.abs(_err_transient), axis=0))
+
+        _err = _E_ex[_src] - Eref[:_n_ex]
+        _err_tail = _E_ex[_src, _tail] - Eref[_tail]
+        _mae = db(np.mean(np.abs(_err), axis = 0))
+        _mae_tail = db(np.mean(np.abs(_err_tail), axis=0))
+    
+        print(rf"Error for $K_i$={_Nroom}, $\bar{{m}}$={_tau_avg}: Total MAE={np.round(_mae,3)}dB, Late MAE={np.round(_mae_tail, 3)}, Transient MAE=_{np.round(_mae_transient, 3)}")
+        return (_mae, _mae_tail, _mae_transient)
+    
+
+    return get_energy_error, run_gfdn_for_Nroom
 
 
+@app.cell
+def _(
+    Eref_chain,
+    Eref_complete,
+    avg_delays,
+    db,
+    delays,
+    fig_path,
+    get_energy_error,
+    mo,
+    np,
+    plt,
+    run_gfdn_for_Nroom,
+):
     Nroom_values = [8, 16, 24, 32]
     avg_delay_values = [1000, 2000, 4000, 8000]
     _fig, _ax = plt.subplots(figsize=(7, 4.5))
+    use_chain_topology = True
+    E_ref = Eref_chain if use_chain_topology else Eref_complete
 
     for _i, _Nroom in enumerate(Nroom_values):
 
         print(f"Running Nroom = {_Nroom}...")
 
-        _Y_chain, _delays = run_chain_for_Nroom(avg_delay_values[-1], _Nroom)
+        _Y, _delays = run_gfdn_for_Nroom(10000, _Nroom, use_chain_topology=use_chain_topology)
+        _error = get_energy_error(_Y, _delays, _Nroom, 10000, E_ref)
 
         # --------------------------------------------------------
         # Use the valid portion of the signal
         # --------------------------------------------------------
-        _n_ex = _Y_chain.shape[1] - _delays.max() - 1
+        _n_ex = _Y.shape[1] - _delays.max() - 1
         _ind_slice = np.arange(max(_n_ex - delays.sum(), 0), _n_ex, dtype=np.int32)
-        _S2_ss = _Y_chain[0, _ind_slice, :]**2
+        _S2_ss = _Y[0, _ind_slice, :]**2
 
         _E_ss = _S2_ss.flatten()
 
-        _Ntot = Y_chain.shape[-1]
-        _E_expected = _S2_ss.sum() / _Ntot
+        _Ntot = _Y.shape[-1]
+        _E_expected = _S2_ss.sum()
         _to_plot = _E_ss / _E_expected
 
         # --------------------------------------------------------
@@ -918,7 +971,7 @@ def _(
         )
 
         _ax.stairs(
-            _counts,
+            np.log10(_counts + np.finfo(np.float32).eps),
             _bins,
             label=rf"$K_i={_Nroom}, \sigma = {db(np.std(_to_plot)):.3f}$ dB",
         )
@@ -927,7 +980,7 @@ def _(
     _ax.set_xlabel(
         r"Normalised delay-line energy"
     )
-    _ax.set_ylabel("Num delay elements")
+    _ax.set_ylabel("Num delay elements (log10)")
     _ax.set_xlim(0, 5*1e-5)
     _ax.legend()
 
@@ -937,22 +990,24 @@ def _(
 
     _fig.savefig(fig_path / f'delay_line_energy_histogram_del_len={avg_delays.value}_Ngrp_sweep.png', dpi=300)
     mo.mpl.interactive(_fig)
-    return Nroom_values, avg_delay_values, run_chain_for_Nroom
+    return E_ref, Nroom_values, avg_delay_values, use_chain_topology
 
 
 @app.cell
 def _(
+    E_ref,
     Nroom_values,
-    Y_chain,
     avg_delay_values,
     db,
     delays,
     fig_path,
     fs,
+    get_energy_error,
     mo,
     np,
     plt,
-    run_chain_for_Nroom,
+    run_gfdn_for_Nroom,
+    use_chain_topology,
 ):
     _fig, _ax = plt.subplots(figsize=(7, 4.5))
 
@@ -960,19 +1015,21 @@ def _(
 
         print(f"Running delay line length = {_avg_tau}...")
 
-        _Y_chain, _delays = run_chain_for_Nroom(_avg_tau, Nroom_values[-1])
+        _Y, _delays = run_gfdn_for_Nroom(_avg_tau, Nroom_values[-1], use_chain_topology=use_chain_topology)
+        _error = get_energy_error(_Y, _delays, Nroom_values[-1], _avg_tau, E_ref)
+
 
         # --------------------------------------------------------
         # Use the valid portion of the signal
         # --------------------------------------------------------
-        _n_ex = _Y_chain.shape[1] - _delays.max() - 1
+        _n_ex = _Y.shape[1] - _delays.max() - 1
         _ind_slice = np.arange(max(_n_ex - delays.sum(), 0), _n_ex, dtype=np.int32)
-        _S2_ss = _Y_chain[0, _ind_slice, :]**2
+        _S2_ss = _Y[0, _ind_slice, :]**2
 
         _E_ss = _S2_ss.flatten()
 
-        _Ntot = Y_chain.shape[-1]
-        _E_expected = _S2_ss.sum() / _Ntot
+        _Ntot = _Y.shape[-1]
+        _E_expected = _S2_ss.sum()
         _to_plot = _E_ss / _E_expected
 
         # --------------------------------------------------------
@@ -986,7 +1043,7 @@ def _(
         )
 
         _ax.stairs(
-            _counts,
+            np.log10(_counts + np.finfo(np.float32).eps),
             _bins,
             label=rf"$\bar{{m}}={_avg_tau / fs * 1e3:.3f}ms, \sigma = {db(np.std(_to_plot)):.3f}$ dB",
         )
@@ -994,7 +1051,7 @@ def _(
     _ax.set_xlabel(
         r"Normalised delay-line energy"
     )
-    _ax.set_ylabel("Num delay elements")
+    _ax.set_ylabel("Num delay elements (log10)")
     _ax.set_xlim(0, 5*1e-5)
     _ax.legend()
 
@@ -1023,8 +1080,8 @@ def _(
 ):
     _tail = slice(int(0.85 * n_ex), n_ex)
 
-    _err_chain = np.max(np.abs(E_ex_chain[0] - Eref_chain[:n_ex]))
-    _err_complete = np.max(np.abs(E_ex_complete[0] - Eref_complete[:n_ex]))
+    _err_chain = E_ex_chain[0] - Eref_chain[:n_ex]
+    _err_complete = E_ex_complete[0] - Eref_complete[:n_ex]
 
     _gfdn_tail_chain = E_ex_chain[0, _tail].mean(0)
     _gfdn_split_chain = _gfdn_tail_chain / _gfdn_tail_chain.sum()
@@ -1042,11 +1099,13 @@ def _(
         delays[N1 + N2:].sum())
     _equipartition_split = np.array([_M1, _M2, _M3]) / (_M1 + _M2 + _M3)
 
+
+
     mo.md(rf"""
     ## 4 · How closely does the GFDN track the physics?
 
     Max absolute deviation between the exact GFDN ledger and the true $e^{{tQ}}$ trajectory over the
-    whole impulse response: chain = **{_err_chain:.4f}**, complete = **{_err_complete:.4f}**.
+    whole impulse response: chain = **{np.max(np.abs(_err_chain)):.4f}**, complete = **{np.abs(np.max(_err_complete)):.4f}**.
 
     **Numeric long-run split for chain topology** (mean over the last 15% of the simulation):
 
