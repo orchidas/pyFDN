@@ -12,21 +12,21 @@ def _():
 
     from numpy.typing import NDArray, ArrayLike
     from scipy.linalg import block_diag, expm
-    from tqdm import tqdm
+
 
     import pyFDN
-    from pyFDN.td import TimeVaryingMatrix
+    from pyFDN.build import FDNBuild
     from pyFDN.auxiliary.physics_based_coupling import (
         create_lossless_coupling_matrix, create_diagonal_absorption_matrix,
         create_state_transition_matrix, trajectory, trajectory_with_delays,
         get_coupling_angles, get_coupling_matrix, get_decay_matrix,
-        get_feedback_matrix, run_gfdn, gfdn_energy_ledger)
+        get_feedback_matrix, get_room_time_varying_matrix, gfdn_energy_ledger)
 
 
     return (
         ArrayLike,
+        FDNBuild,
         NDArray,
-        TimeVaryingMatrix,
         block_diag,
         create_diagonal_absorption_matrix,
         create_lossless_coupling_matrix,
@@ -36,12 +36,12 @@ def _():
         get_coupling_matrix,
         get_decay_matrix,
         get_feedback_matrix,
+        get_room_time_varying_matrix,
         gfdn_energy_ledger,
         mo,
         np,
         plt,
         pyFDN,
-        run_gfdn,
         trajectory,
     )
 
@@ -117,13 +117,13 @@ def _(mo):
 
     Nper = mo.ui.slider(4,
                         48,
-                        value=32,
+                        value=16,
                         step=2,
                         label="delay lines per room $N_i$ (equal)")
 
     avg_delays = mo.ui.slider(100,
                               10000,
-                              value=5000,
+                              value=2000,
                               step=100,
                               label="Avg delay line length in samples")
 
@@ -193,7 +193,7 @@ def _(
 
 
 @app.cell
-def _(NDArray, Nper, V, avg_delays, mo, np, num_rooms, pyFDN):
+def _(ArrayLike, NDArray, Nper, V, avg_delays, mo, np, num_rooms, pyFDN):
     # --- Geometry: equal N per room, M_i proportional to V_i -------------------
     fs = 48000
     Nroom = Nper.value
@@ -218,13 +218,47 @@ def _(NDArray, Nper, V, avg_delays, mo, np, num_rooms, pyFDN):
         delays = np.concatenate(delays).astype(int)
         return delays
 
-    delays = sample_delay_line_lengths(avg_delays.value, Nroom)
+    def match_delay_totals_to_volumes(base_delays: ArrayLike, lines_per_group:int, volumes:ArrayLike, target_total=None):
+        """Match integer volume ratios exactly, retaining each group's delay spread.
+
+        Start from independently sampled coprime delays, then apportion integer
+        lengths to exact group totals. No coprimality constraint is imposed on
+        the result. Its total number of cells stays close to the original total.
+        Supply target_total to choose the nearest feasible total to a requested
+        global mean instead of retaining the original sampled total.
+        """
+        volumes = np.asarray(volumes, dtype=float)
+        integer_volumes = np.rint(volumes).astype(np.int64)
+        if np.any(volumes <= 0) or not np.allclose(volumes, integer_volumes):
+            raise ValueError("Exact-ratio comparison requires positive integer volumes.")
+        weights = integer_volumes // np.gcd.reduce(integer_volumes)
+        base = np.asarray(base_delays, dtype=np.int64).reshape(
+            len(volumes), lines_per_group)
+        state_count = base.sum() if target_total is None else target_total
+        multiplier = max(
+            int(np.rint(state_count / weights.sum())),
+            int(np.max(np.ceil(lines_per_group / weights))),
+        )
+        targets = multiplier * weights
+        matched = []
+        for group, target in zip(base, targets):
+            # Reserve one cell per line, then use largest-remainder rounding.
+            ideal = 1 + (target - lines_per_group) * group / group.sum()
+            lengths = np.floor(ideal).astype(np.int64)
+            remainder = int(target - lengths.sum())
+            order = np.argsort(-(ideal - lengths), kind="stable")
+            lengths[order[:remainder]] += 1
+            matched.append(lengths)
+        return np.concatenate(matched)
+
+    co_prime_delays = sample_delay_line_lengths(avg_delays.value, Nroom)
+    delays = match_delay_totals_to_volumes(co_prime_delays, Nroom, V)
     M1, M2, M3 = int(delays[:N1].sum()), int(delays[N1:N1 + N2].sum()), int(
         delays[N1 + N2:].sum())
     delays_per_fdn = np.asarray(
         [delays[:N1], delays[N1:N1 + N2], delays[N1 + N2:]], dtype=np.int32)
-    M = np.asarray([M1, M2, M3])
-    dt_i = M / (Nroom * fs)
+    _delay_totals = np.asarray([M1, M2, M3])
+    dt_i = _delay_totals / (Nroom * fs)
 
     mo.md(rf"""
     ## 1 · Geometry — $M_i \propto V_i$, equal $N_i$ (so $\mathbf D=\mathbf I$, no weighting needed)
@@ -236,20 +270,9 @@ def _(NDArray, Nper, V, avg_delays, mo, np, num_rooms, pyFDN):
     | actual $\sum d_j$ | {int(delays[:N1].sum())} | {int(delays[N1:N1+N2].sum())} | {int(delays[N1+N2:].sum())} |
     | $\Delta t_i=M_i/(N_if_s)$ | {dt_i[0]*1000:.3f} ms | {dt_i[1]*1000:.3f} ms | {dt_i[2]*1000:.3f} ms |
     | $V_i / \sum_i V_i$ | {V[0] / np.sum(V):.3f}  | {V[1] / np.sum(V):.3f} | {V[2] / np.sum(V):.3f} |
-    | $M_i / \sum_i M_i$ | {M1 / np.sum(M):.3f}  | {M2 / np.sum(M):.3f} | {M3 / np.sum(M):.3f} |
+    | $M_i / \sum_i M_i$ | {M1 / np.sum(_delay_totals):.3f}  | {M2 / np.sum(_delay_totals):.3f} | {M3 / np.sum(_delay_totals):.3f} |
     """)
-    return (
-        N1,
-        N2,
-        N3,
-        Nroom,
-        Ntot,
-        delays,
-        delays_per_fdn,
-        dt_i,
-        fs,
-        sample_delay_line_lengths,
-    )
+    return N1, N2, N3, Nroom, Ntot, delays, delays_per_fdn, dt_i, fs
 
 
 @app.cell
@@ -274,7 +297,7 @@ def _(
     for _i in range(num_rooms):
         for _j in range(_i + 1, num_rooms):
             _check.append(
-                (beta_chain[_i, _j] * dt_i[_i], beta_chain[_j, _i] * dt_i[_j]))
+                (beta_complete[_i, _j] * dt_i[_i], beta_complete[_j, _i] * dt_i[_j]))
 
     mo.md(rf"""
     ## 2 · Pairwise angles $\theta_{{ij}}$ (rate‑matched, $\sin^2\theta_{{ij}}=\beta_{{ij}}\Delta t_i$)
@@ -301,16 +324,15 @@ def _(
     N2,
     N3,
     Nroom,
-    Ntot,
     R_room_chain,
     R_room_complete,
-    TimeVaryingMatrix,
     block_diag,
     delays_per_fdn,
     fs,
     gamma,
     get_decay_matrix,
     get_feedback_matrix,
+    get_room_time_varying_matrix,
     mo,
     np,
     pyFDN,
@@ -321,31 +343,50 @@ def _(
     modulation_frequency = 1.0  # hz
     modulation_amplitude = 3.0
     spread = 0.3
-    tv_matrix = TimeVaryingMatrix(Ntot, modulation_frequency,
-                                  modulation_amplitude, fs, spread)
+    # Use identical random rotation parameters for both fixed coupling topologies.
+    _rotation_rng = np.random.get_state()
+    tv_chain = get_room_time_varying_matrix(
+        R_room_chain, Nroom, modulation_frequency, modulation_amplitude, fs, spread)
+    _after_rotation_rng = np.random.get_state()
+    np.random.set_state(_rotation_rng)
+    tv_complete = get_room_time_varying_matrix(
+        R_room_complete, Nroom, modulation_frequency, modulation_amplitude, fs, spread)
+    np.random.set_state(_after_rotation_rng)
 
-    Qblocks = block_diag(pyFDN.random_orthogonal(N1),
-                         pyFDN.random_orthogonal(N2),
-                         pyFDN.random_orthogonal(N3))
-
-    A_chain = get_feedback_matrix(R_room_chain, Qblocks, Nroom)
-    A_complete = get_feedback_matrix(R_room_complete, Qblocks, Nroom)
-
-    Gamma = get_decay_matrix(gamma, delays_per_fdn, fs)
-    A_chain_lossy = A_chain @ Gamma
-    A_complete_lossy = A_complete @ Gamma
+    M = block_diag(pyFDN.random_orthogonal(N1),
+                   pyFDN.random_orthogonal(N2), pyFDN.random_orthogonal(N3))
+    G = get_decay_matrix(gamma, delays_per_fdn, fs)
+    F_chain = np.kron(R_room_chain, np.eye(Nroom))
+    F_complete = np.kron(R_room_complete, np.eye(Nroom))
+    A_chain = get_feedback_matrix(R_room_chain, M, Nroom)  # F_chain @ M
+    A_complete = get_feedback_matrix(R_room_complete, M, Nroom)
+    A_chain_lossy = A_chain @ G
+    A_complete_lossy = A_complete @ G
 
     _ok_chain = pyFDN.is_unilossless(A_chain)
     _ok_complete = pyFDN.is_unilossless(A_complete)
 
     mo.md(rf"""
-    ## 3 · The two GFDN feedback matrices
+    ## 3 · Fixed coupling and time-varying internal room mixers
 
     Same internal room mixers $\mathbf Q_1,\mathbf Q_2,\mathbf Q_3$ for both — only the room‑coupling
     $\mathbf R_{{\rm room}}$ differs. `is_unilossless`: chain = **{_ok_chain}**, complete = **{_ok_complete}**
     (both should be `True` — pure exchange, no absorption).
+
+    $M=\operatorname{{blkdiag}}(M_1,M_2,M_3)$ contains the orthogonal room mixers.
+    $G_{{jj}}=\exp(-\gamma_i m_j/(2f_s))$ contains per-line amplitude absorption.
+    For either topology, $F=\Phi\otimes I_K$, `A = F @ M`, and `A_lossy = F @ M @ G`.
+    The hook $H(n)=F R(n)F^\top$ makes the effective feedback $F R(n)M G$:
+    only $M_i(n)=R_i(n)M_i$ varies, while the room coupling stays fixed.
     """)
-    return A_chain, A_chain_lossy, A_complete, A_complete_lossy
+    return (
+        A_chain,
+        A_chain_lossy,
+        A_complete,
+        A_complete_lossy,
+        tv_chain,
+        tv_complete,
+    )
 
 
 @app.cell
@@ -354,6 +395,7 @@ def _(
     A_chain_lossy,
     A_complete,
     A_complete_lossy,
+    FDNBuild,
     N1,
     N2,
     N3,
@@ -365,7 +407,9 @@ def _(
     gfdn_energy_ledger,
     np,
     num_rooms,
-    run_gfdn,
+    pyFDN,
+    tv_chain,
+    tv_complete,
 ):
     # --- Impulse responses + exact per-room energy ledger, all rooms excited equally -----
     n_samp = int(dur.value * fs)
@@ -375,26 +419,32 @@ def _(
     B[N1 + N2:, 2] = 1.0 / np.sqrt(N3)
     # output taken from all rooms
     C_lines = np.eye(Ntot)
-    src = 0
+    chain_build = FDNBuild(
+        A=A_chain, B=B, C=C_lines, D=np.zeros((Ntot, num_rooms)),
+        delays=delays, fs=fs, post_matrix=tv_chain)
+    chain_lossy_build = FDNBuild(
+        A=A_chain_lossy, B=B, C=C_lines, D=np.zeros((Ntot, num_rooms)),
+        delays=delays, fs=fs, post_matrix=tv_chain)
+    complete_build = FDNBuild(
+        A=A_complete, B=B, C=C_lines, D=np.zeros((Ntot, num_rooms)),
+        delays=delays, fs=fs, post_matrix=tv_complete)
+    complete_lossy_build = FDNBuild(
+        A=A_complete_lossy, B=B, C=C_lines, D=np.zeros((Ntot, num_rooms)),
+        delays=delays, fs=fs, post_matrix=tv_complete)
 
-    Y_chain = run_gfdn(A_chain, B, C_lines, delays, n_samp, src=src)
-    Y_chain_lossy = run_gfdn(A_chain_lossy,
-                             B,
-                             C_lines,
-                             delays,
-                             n_samp,
-                             src=src,
-                             # tv_matrix=tv_matrix
-                            )
-    Y_complete = run_gfdn(A_complete, B, C_lines, delays, n_samp, src=src)
-    Y_complete_lossy = run_gfdn(A_complete_lossy,
-                                B,
-                                C_lines,
-                                delays,
-                                n_samp,
-                                src=src, 
-                                # tv_matrix=tv_matrix
-                               )
+    def _render_sources(build):
+        responses = np.zeros((num_rooms, n_samp, Ntot))
+        for source in range(num_rooms):
+            signal = np.zeros((n_samp, num_rooms))
+            signal[0, source] = 1
+            build.post_matrix.reset()
+            responses[source] = pyFDN.process_fdn(signal, build)
+        return responses
+
+    Y_chain = _render_sources(chain_build)
+    Y_chain_lossy = _render_sources(chain_lossy_build)
+    Y_complete = _render_sources(complete_build)
+    Y_complete_lossy = _render_sources(complete_lossy_build)
 
     E_ex_chain, n_ex = gfdn_energy_ledger(Y_chain, num_rooms, Nroom, delays)
     E_ex_chain_lossy, _ = gfdn_energy_ledger(Y_chain_lossy, num_rooms, Nroom,
@@ -407,7 +457,6 @@ def _(
         E_ex_chain_lossy,
         E_ex_complete,
         E_ex_complete_lossy,
-        Y_chain,
         Y_chain_lossy,
         Y_complete_lossy,
         n_ex,
@@ -617,7 +666,7 @@ def _(E_ex_chain, E_ex_complete, Eref_chain, Eref_complete, fs, np, num_rooms):
             print(f'Cur reference time constant for room {_r+1} is {tau_ref[_r]:.3f}s')
             tau_gfdn[_r] = calculate_time_constant(_Eref[:, _r], fs, is_rising)
             print(f'Cur GFDN time constant for room {_r+1} is {tau_gfdn[_r]:.3f}s')
-    return (calculate_time_constant,)
+    return
 
 
 @app.cell
@@ -694,373 +743,10 @@ def _(
 
 @app.cell(hide_code=True)
 def _(mo):
-    mo.md(r"""
-    ### Plot the delay line energy of the GFDN at steady state - these should be uniform
+    mo.md("""
+    Parameter-sweep plots and comparison tables have moved to
+    `examples/coupled_rooms/three_coupled_room_metrics.py`.
     """)
-    return
-
-
-@app.cell
-def _(
-    Nroom,
-    Y_chain,
-    avg_delays,
-    db,
-    fs,
-    mo,
-    np,
-    num_rooms,
-    plt,
-    pyFDN,
-    src_room,
-):
-    from pathlib import Path
-
-    def delay_line_kl_divergence(_E_ss) -> float:
-        """
-        KL divergence of the delay-line steady-state energy
-        distribution from the uniform distribution.
-        """
-
-        _p = _E_ss / np.sum(_E_ss)
-        _N = len(_p)
-
-        _D_KL = np.sum(
-            _p * np.log(_p * _N)
-        )
-
-        return _D_KL
-
-    def plot_gfdn_delay_element_distributions(
-        _Y,
-        _steady_state_start:int,
-    ):
-        """
-        Plot the distribution of delay-element energies at selected times.
-        """
-
-        # squared delay-line states
-        _S2 = _Y**2
-
-        # Select steady-state samples
-        _S2_ss = _S2[_steady_state_start:, :]
-
-        # Average over input/realisation and time
-        _E_ss = _S2_ss.mean(axis=0)
-        _E_ss_per_group = np.zeros(num_rooms, dtype=np.float32)
-        for _k in range(num_rooms):
-            _E_ss_per_group[_k] = _E_ss[_k*Nroom:(_k+1)*Nroom].mean()
-        _E_ss_group_variance = np.std(_E_ss_per_group)/ np.mean(_E_ss_per_group)
-
-
-        _fig, _ax = plt.subplots(figsize=(6, 4))
-
-        _ax.bar(
-            np.arange(len(_E_ss)),
-            _E_ss,
-        )
-
-        kl_div = delay_line_kl_divergence(_E_ss)
-
-        _ax.axhline(
-            _E_ss.mean(),
-            linestyle="--",
-            color='k',
-            label=rf"mean energy",
-        )
-
-        _ax.set_xlabel("Delay line $j$")
-        _ax.set_ylabel(r"$\mathbb{{E}}[s^{j}(m_j + \infty)^2]$")
-        _ax.set_title(rf"$D_{{KL}}(\mathrm{{unif.}}= {kl_div:.4f}, \text{{Var}} \left(\mathbb{{E}}(\sum_{{i \in \text{{FDN_i}}}}s_i^2(\infty)) \right) = {db(_E_ss_group_variance):.4f}$")
-        _ax.legend()
-
-        return _E_ss, _ax, _fig
-
-
-    steady_state_start_ms, echo_density = pyFDN.echo_density(ir=Y_chain[src_room, ...].sum(axis=-1), fs=fs)
-    steady_state_start_samp = int(steady_state_start_ms * 1e-3 * fs)
-    Ess, _ax, _fig = plot_gfdn_delay_element_distributions(Y_chain[src_room, ...], steady_state_start_samp)
-
-    fig_path = Path(f'../GroupedFDN/figures')
-    _fig.savefig(fig_path / f'delay_line_energy_dist_del_len={avg_delays.value}_Ngrp={Nroom}.png', dpi=300)
-
-    mo.mpl.interactive(_fig)
-    return (fig_path,)
-
-
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    ### Sweep over different delay line lengths and numbers and plot the energy distribution histograms and calculate mean trajectory deviation errors
-    """)
-    return
-
-
-@app.cell
-def _(
-    ArrayLike,
-    NDArray,
-    beta_chain,
-    beta_complete,
-    block_diag,
-    calculate_time_constant,
-    db,
-    dur,
-    expm,
-    fs,
-    get_coupling_angles,
-    get_coupling_matrix,
-    get_feedback_matrix,
-    gfdn_energy_ledger,
-    np,
-    num_rooms,
-    pyFDN,
-    run_gfdn,
-    sample_delay_line_lengths,
-):
-    def run_gfdn_for_Nroom(_avg_tau: float, _Nroom: int, use_chain_topology:bool=True) -> NDArray:
-        """Run GFDN for different delay line lengths and numbers"""
-    
-        N1 = N2 = N3 = _Nroom
-        Ntot = num_rooms * _Nroom
-
-        # ------------------------------------------------------------
-        # Delay lengths
-        # -----------------------------------------------------------
-        delays = sample_delay_line_lengths(_avg_tau, _Nroom)
-
-        M = np.array([
-            delays[:N1].sum(),
-            delays[N1:N1 + N2].sum(),
-            delays[N1 + N2:].sum(),
-        ])
-
-        dt_i = M / (_Nroom * fs)
-
-        # ------------------------------------------------------------
-        # Coupling matrix
-        # ------------------------------------------------------------
-        if use_chain_topology:
-            theta = get_coupling_angles(beta_chain, dt_i)
-        else:
-            theta = get_coupling_angles(beta_complete, dt_i)
-        K = get_coupling_matrix(theta)
-        R_room = expm(K)
-
-        # ------------------------------------------------------------
-        # Internal room mixers
-        # ------------------------------------------------------------
-        np.random.seed(1)
-
-        Qblocks = block_diag(
-            pyFDN.random_orthogonal(N1),
-            pyFDN.random_orthogonal(N2),
-            pyFDN.random_orthogonal(N3),
-        )
-
-        A = get_feedback_matrix(
-            R_room,
-            Qblocks,
-            _Nroom,
-        )
-
-        # ------------------------------------------------------------
-        # Input
-        # ------------------------------------------------------------
-        B = np.zeros((Ntot, num_rooms))
-
-        B[:N1, 0] = 1.0 / np.sqrt(N1)
-        B[N1:N1 + N2, 1] = 1.0 / np.sqrt(N2)
-        B[N1 + N2:, 2] = 1.0 / np.sqrt(N3)
-
-        C_lines = np.eye(Ntot)
-        n_samp = int(dur.value * fs)
-
-        Y = run_gfdn(
-            A,
-            B,
-            C_lines,
-            delays,
-            n_samp,
-            src=0,
-        )
-
-        return Y, delays
-
-    def get_energy_error(_Y:NDArray, _delays: ArrayLike, _Nroom:int, 
-                         _tau_avg:float,  Eref: NDArray, _src:int=0,
-                        _use_transient_calc: bool = False):
-        """Calculate the MAE between the GFDN trajectory and Markov trajectory (Eref)"""
-    
-        _E_ex, _n_ex = gfdn_energy_ledger(_Y, num_rooms, _Nroom, _delays)
-        _tail = slice(int(0.85 * _n_ex), _n_ex)
-
-        if _use_transient_calc:
-            _mae_transient = np.zeros(num_rooms, dtype=np.float32)
-            for _k in range(num_rooms):
-                _transient_start_time = calculate_time_constant(_E_ex[_src, :_n_ex, _k], fs, is_rising=_k!=0)
-                _transient_start_samp = int(_transient_start_time * fs)
-                _transient_ind = slice(0, _transient_start_samp)
-                _err_transient = _E_ex[_src, _transient_ind, _k] - Eref[_transient_ind, _k]
-                _mae_transient[_k] = db(np.mean(np.abs(_err_transient)))
-        else:
-            _transient_ind = slice(0, int(0.2 * fs))
-            _err_transient = _E_ex[_src, _transient_ind] - Eref[_transient_ind]
-            _mae_transient = db(np.mean(np.abs(_err_transient), axis=0))
-
-        _err = _E_ex[_src] - Eref[:_n_ex]
-        _err_tail = _E_ex[_src, _tail] - Eref[_tail]
-        _mae = db(np.mean(np.abs(_err), axis = 0))
-        _mae_tail = db(np.mean(np.abs(_err_tail), axis=0))
-    
-        print(rf"Error for $K_i$={_Nroom}, $\bar{{m}}$={_tau_avg}: Total MAE={np.round(_mae,3)}dB, Late MAE={np.round(_mae_tail, 3)}, Transient MAE=_{np.round(_mae_transient, 3)}")
-        return (_mae, _mae_tail, _mae_transient)
-    
-
-    return get_energy_error, run_gfdn_for_Nroom
-
-
-@app.cell
-def _(
-    Eref_chain,
-    Eref_complete,
-    avg_delays,
-    db,
-    delays,
-    fig_path,
-    get_energy_error,
-    mo,
-    np,
-    plt,
-    run_gfdn_for_Nroom,
-):
-    Nroom_values = [8, 16, 24, 32]
-    avg_delay_values = [1000, 2000, 4000, 8000]
-    _fig, _ax = plt.subplots(figsize=(7, 4.5))
-    use_chain_topology = True
-    E_ref = Eref_chain if use_chain_topology else Eref_complete
-
-    for _i, _Nroom in enumerate(Nroom_values):
-
-        print(f"Running Nroom = {_Nroom}...")
-
-        _Y, _delays = run_gfdn_for_Nroom(10000, _Nroom, use_chain_topology=use_chain_topology)
-        _error = get_energy_error(_Y, _delays, _Nroom, 10000, E_ref)
-
-        # --------------------------------------------------------
-        # Use the valid portion of the signal
-        # --------------------------------------------------------
-        _n_ex = _Y.shape[1] - _delays.max() - 1
-        _ind_slice = np.arange(max(_n_ex - delays.sum(), 0), _n_ex, dtype=np.int32)
-        _S2_ss = _Y[0, _ind_slice, :]**2
-
-        _E_ss = _S2_ss.flatten()
-
-        _Ntot = _Y.shape[-1]
-        _E_expected = _S2_ss.sum()
-        _to_plot = _E_ss / _E_expected
-
-        # --------------------------------------------------------
-        # Histogram
-        # --------------------------------------------------------
-        _counts, _bins = np.histogram(
-            _to_plot,
-            bins=50000,
-            range=(0, 0.1),
-            density=True,
-        )
-
-        _ax.stairs(
-            np.log10(_counts + np.finfo(np.float32).eps),
-            _bins,
-            label=rf"$K_i={_Nroom}, \sigma = {db(np.std(_to_plot)):.3f}$ dB",
-        )
-   
-
-    _ax.set_xlabel(
-        r"Normalised delay-line energy"
-    )
-    _ax.set_ylabel("Num delay elements (log10)")
-    _ax.set_xlim(0, 5*1e-5)
-    _ax.legend()
-
-    _fig.tight_layout()
-
-    mo.mpl.interactive(_fig)
-
-    _fig.savefig(fig_path / f'delay_line_energy_histogram_del_len={avg_delays.value}_Ngrp_sweep.png', dpi=300)
-    mo.mpl.interactive(_fig)
-    return E_ref, Nroom_values, avg_delay_values, use_chain_topology
-
-
-@app.cell
-def _(
-    E_ref,
-    Nroom_values,
-    avg_delay_values,
-    db,
-    delays,
-    fig_path,
-    fs,
-    get_energy_error,
-    mo,
-    np,
-    plt,
-    run_gfdn_for_Nroom,
-    use_chain_topology,
-):
-    _fig, _ax = plt.subplots(figsize=(7, 4.5))
-
-    for _i, _avg_tau in enumerate(avg_delay_values):
-
-        print(f"Running delay line length = {_avg_tau}...")
-
-        _Y, _delays = run_gfdn_for_Nroom(_avg_tau, Nroom_values[-1], use_chain_topology=use_chain_topology)
-        _error = get_energy_error(_Y, _delays, Nroom_values[-1], _avg_tau, E_ref)
-
-
-        # --------------------------------------------------------
-        # Use the valid portion of the signal
-        # --------------------------------------------------------
-        _n_ex = _Y.shape[1] - _delays.max() - 1
-        _ind_slice = np.arange(max(_n_ex - delays.sum(), 0), _n_ex, dtype=np.int32)
-        _S2_ss = _Y[0, _ind_slice, :]**2
-
-        _E_ss = _S2_ss.flatten()
-
-        _Ntot = _Y.shape[-1]
-        _E_expected = _S2_ss.sum()
-        _to_plot = _E_ss / _E_expected
-
-        # --------------------------------------------------------
-        # Histogram
-        # --------------------------------------------------------
-        _counts, _bins = np.histogram(
-            _to_plot,
-            bins=50000,
-            range=(0, 0.1),
-            density=True,
-        )
-
-        _ax.stairs(
-            np.log10(_counts + np.finfo(np.float32).eps),
-            _bins,
-            label=rf"$\bar{{m}}={_avg_tau / fs * 1e3:.3f}ms, \sigma = {db(np.std(_to_plot)):.3f}$ dB",
-        )
-   
-    _ax.set_xlabel(
-        r"Normalised delay-line energy"
-    )
-    _ax.set_ylabel("Num delay elements (log10)")
-    _ax.set_xlim(0, 5*1e-5)
-    _ax.legend()
-
-    _fig.tight_layout()
-
-    mo.mpl.interactive(_fig)
-
-    _fig.savefig(fig_path / f'delay_line_energy_histogram_Ngrp={Nroom_values[-1]}_avg_delay_line_length_sweep.png', dpi=300)
-    mo.mpl.interactive(_fig)
     return
 
 
@@ -1098,6 +784,8 @@ def _(
     _M1, _M2, _M3 = int(delays[:N1].sum()), int(delays[N1:N1 + N2].sum()), int(
         delays[N1 + N2:].sum())
     _equipartition_split = np.array([_M1, _M2, _M3]) / (_M1 + _M2 + _M3)
+    _density_ratio_chain = _gfdn_split_chain / _equipartition_split
+    _density_ratio_complete = _gfdn_split_complete / _equipartition_split
 
 
 
@@ -1114,7 +802,8 @@ def _(
     | GFDN (exact ledger) | {_gfdn_split_chain[0]:.4f} | {_gfdn_split_chain[1]:.4f} | {_gfdn_split_chain[2]:.4f} |
     | reference $e^{{tQ}}$ | {_ref_split_chain[0]:.4f} | {_ref_split_chain[1]:.4f} | {_ref_split_chain[2]:.4f} |
     | target $V_i/V_{{\rm tot}}$ | {_target_split[0]:.4f} | {_target_split[1]:.4f} | {_target_split[2]:.4f} |
-    | $M_i/M_{{\rm tot}}$ (theoretical GFDN asymptote) | {_equipartition_split[0]:.4f} | {_equipartition_split[1]:.4f} | {_equipartition_split[2]:.4f} |
+    | $M_i/M_{{\rm tot}}$ (equipartition target) | {_equipartition_split[0]:.4f} | {_equipartition_split[1]:.4f} | {_equipartition_split[2]:.4f} |
+    | cell energy / global cell energy (target: 1) | {_density_ratio_chain[0]:.4f} | {_density_ratio_chain[1]:.4f} | {_density_ratio_chain[2]:.4f} |
 
     **Numeric long-run split for complete topology** (mean over the last 15% of the simulation):
 
@@ -1123,17 +812,19 @@ def _(
     | GFDN (exact ledger) | {_gfdn_split_complete[0]:.4f} | {_gfdn_split_complete[1]:.4f} | {_gfdn_split_complete[2]:.4f} |
     | reference $e^{{tQ}}$ | {_ref_split_complete[0]:.4f} | {_ref_split_complete[1]:.4f} | {_ref_split_complete[2]:.4f} |
     | target $V_i/V_{{\rm tot}}$ | {_target_split[0]:.4f} | {_target_split[1]:.4f} | {_target_split[2]:.4f} |
-    | $M_i/M_{{\rm tot}}$ (theoretical GFDN asymptote) | {_equipartition_split[0]:.4f} | {_equipartition_split[1]:.4f} | {_equipartition_split[2]:.4f} |
+    | $M_i/M_{{\rm tot}}$ (equipartition target) | {_equipartition_split[0]:.4f} | {_equipartition_split[1]:.4f} | {_equipartition_split[2]:.4f} |
+    | cell energy / global cell energy (target: 1) | {_density_ratio_complete[0]:.4f} | {_density_ratio_complete[1]:.4f} | {_density_ratio_complete[2]:.4f} |
 
-    **The GFDN's true long-run target is the $M_i/M_{{\rm tot}}$ row, not $V_i/V_{{\rm tot}}$ directly**
-    — the mixing angle $\theta$ only sets *how fast* the GFDN approaches it, never *where* it ends up.
-    $V_i/V_{{\rm tot}}$ and $M_i/M_{{\rm tot}}$ should be close to each other by design (that's the whole
-    point of $M_i\propto V_i$), but they're two different quantities: if the GFDN row disagrees with
-    $M_i/M_{{\rm tot}}$, suspect insufficient equilibration time (try increasing `dur` well beyond a
-    few relaxation times and see if it keeps drifting toward $M_i/M_{{\rm tot}}$) or something in the
-    live delay-line/matrix realization; if it already matches $M_i/M_{{\rm tot}}$ but that itself is
-    off from $V_i/V_{{\rm tot}}$, the fix is tightening the delay-length design so $M_1/M_2$ lands
-    closer to $V_1/V_2$.
+    **Separate incomplete equipartition from delay-allocation error.**
+    Uniform mean energy per delay cell implies the $M_i/M_{{\rm tot}}$ split.
+    It matches SA only when these delay proportions equal $V_i/V_{{\rm tot}}$.
+    Cell-energy ratios near 1 therefore can coexist with a room-energy mismatch against SA.
+    A fixed lossless matrix need not attain equipartition: residual coherence and
+    source-dependent modal excitation can sustain a bias. Modulation can reduce this
+    bias, but a finite-window measurement is not a proof of asymptotic convergence.
+    The endpoint plot and ledger both use the last 15% of the valid simulation;
+    endpoint-derived cell totals still have a finite-window shift error because
+    different cells correspond to different time shifts of their delay-line output.
     """)
     return
 

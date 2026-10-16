@@ -5,7 +5,7 @@ from typing import Optional, Tuple, List, Union
 from numpy.typing import NDArray, ArrayLike
 
 import pyFDN
-from pyFDN.td import TimeVaryingMatrix
+from pyFDN.td import Gain, Series, TimeOperator, TimeVaryingMatrix
 
 
 def create_lossless_coupling_matrix(aperture_area: NDArray,
@@ -227,15 +227,96 @@ def get_feedback_matrix(R_room: NDArray,
         return D @ R_room_lift @ np.linalg.inv(D) @ Qblocks
 
 
+def get_room_time_varying_matrix(
+    R_room: ArrayLike,
+    Nroom: int,
+    cycles_per_second: float = 1.0,
+    amplitude: float = 3.0,
+    fs: float = 48000.0,
+    spread: float = 0.3,
+) -> Series:
+    r"""Construct a feedback hook that modulates only the internal room mixers.
+
+    Keep the usual static feedback matrix ``A = F @ M @ G``, where
+    ``F = kron(R_room, eye(Nroom))``, ``M`` contains the block-diagonal room
+    mixers and ``G`` is optional diagonal absorption. This hook applies
+    ``F @ R(n) @ F.T`` AFTER ``A``, so the effective feedback is exactly
+    ``F @ R(n) @ M @ G``. The coupling matrix ``R_room`` stays fixed.
+
+    ``R(n)`` uses the adjacent-pair rotations of :class:`TimeVaryingMatrix`.
+    Since each room has an even number of contiguous channels, all rotations
+    remain inside their room. Each pair has its own random modulation phase,
+    frequency and amplitude, as in ``TimeVaryingMatrix``. Seed NumPy before
+    construction for reproducible parameters.
+
+    Parameters
+    ----------
+    R_room : array-like, shape (num_rooms, num_rooms)
+        Real orthogonal room coupling matrix, before lifting to line space.
+    Nroom : int
+        Positive even number of delay lines per room, equal for all rooms.
+    cycles_per_second, amplitude, fs, spread : float
+        Modulation settings, with the same meaning as ``TimeVaryingMatrix``.
+
+    Returns
+    -------
+    Series
+        Stateful runtime operator for ``process_dss(..., post_matrix=hook)``
+        or ``FDNBuild.post_matrix`` with ``process_fdn``. Call ``hook.reset()``
+        before independent renders or stereo-channel renders that should
+        start with identical modulation. This is a runtime hook, not an SOS
+        array for build serialisation or static frequency-domain analysis.
+
+    Examples
+    --------
+    Use the same coupling matrix that was passed to ``get_feedback_matrix``::
+
+        hook = get_room_time_varying_matrix(Phi, K, fs=fs)
+        y = pyFDN.process_dss(x, delays, A, B, C, D, post_matrix=hook)
+
+    A frozen ``FDNBuild`` can be updated using ``dataclasses.replace``::
+
+        from dataclasses import replace
+        build = replace(build, post_matrix=hook)
+        hook.reset()
+        y = pyFDN.process_fdn(x, build)
+
+    Do not use this hook with a similarity-scaled coupling matrix or with
+    ``A`` containing only the internal mixers: it expects the standard
+    combined feedback ``F @ M @ G``.
+    """
+    if np.iscomplexobj(R_room):
+        raise ValueError("R_room must be a real orthogonal matrix")
+    coupling = np.asarray(R_room, dtype=float)
+    if coupling.ndim != 2 or coupling.shape[0] == 0 or coupling.shape[0] != coupling.shape[1]:
+        raise ValueError("R_room must be a non-empty square matrix")
+    if not np.all(np.isfinite(coupling)) or not np.allclose(
+        coupling.T @ coupling, np.eye(len(coupling)), rtol=0, atol=1e-10
+    ):
+        raise ValueError("R_room must be a real orthogonal matrix")
+    if (isinstance(Nroom, (bool, np.bool_))
+            or not isinstance(Nroom, (int, np.integer))
+            or Nroom <= 0 or Nroom % 2):
+        raise ValueError("Nroom must be a positive even integer")
+    if not np.all(np.isfinite([cycles_per_second, amplitude, fs, spread])) or fs <= 0:
+        raise ValueError("Modulation parameters must be finite and fs must be positive")
+
+    coupling_lift = np.kron(coupling, np.eye(Nroom))
+    rotation = TimeVaryingMatrix(
+        len(coupling) * Nroom, cycles_per_second, amplitude, fs, spread)
+    # Series acts left to right: F.T first, then room rotations, then F.
+    return Series([Gain(coupling_lift.T), rotation, Gain(coupling_lift)])
+
+
 def run_gfdn(A,
              B: NDArray,
              C: NDArray,
              delays: ArrayLike,
              n_samp: int,
              src: Union[int, List] = 0,
-             tv_matrix: Optional[TimeVaryingMatrix] = None):
+             tv_matrix: Optional[TimeOperator] = None):
     """
-    Generic wrapper around process_fdn.
+    Generic wrapper around process_dss.
     Args:
         A (NDArray): Ntot x Ntot feedback matrix (with losses)
         B (NDArray): (Ntot, num_inputs) input matrix
@@ -243,7 +324,9 @@ def run_gfdn(A,
         delays (ArrayLike): delay line lengths in samples
         src (int, list): room where the source is
         n_samp (int): number of time samples
-        tv_matrix (Optional): if using a time varying matrix for increased mixing
+        tv_matrix (TimeOperator, optional): feedback hook, including the operator
+            returned by get_room_time_varying_matrix. Reset it before independent
+            renders when identical initial modulation is required.
     Returns:
         NDArray : GFDN output of size (num_inputs, n_samp, num_outputs)
     """

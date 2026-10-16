@@ -11,19 +11,20 @@ def _():
     import matplotlib.pyplot as plt
     from scipy.linalg import block_diag, expm
     from typing import Optional
-    from numpy.typing import NDArray
+    from numpy.typing import NDArray, ArrayLike
 
     import pyFDN
-    from pyFDN.td import TimeVaryingMatrix
+    from pyFDN.build import FDNBuild
     from pyFDN.auxiliary.physics_based_coupling import (
         create_lossless_coupling_matrix, create_diagonal_absorption_matrix,
         create_state_transition_matrix, trajectory, trajectory_with_delays,
         get_coupling_angles, get_coupling_matrix, get_decay_matrix,
-        get_feedback_matrix, run_gfdn, gfdn_energy_ledger)
+        get_feedback_matrix, get_room_time_varying_matrix, gfdn_energy_ledger)
 
     return (
+        ArrayLike,
+        FDNBuild,
         NDArray,
-        TimeVaryingMatrix,
         block_diag,
         create_diagonal_absorption_matrix,
         create_lossless_coupling_matrix,
@@ -33,12 +34,12 @@ def _():
         get_coupling_matrix,
         get_decay_matrix,
         get_feedback_matrix,
+        get_room_time_varying_matrix,
         gfdn_energy_ledger,
         mo,
         np,
         plt,
         pyFDN,
-        run_gfdn,
         trajectory,
     )
 
@@ -153,7 +154,45 @@ def _(
 
 
 @app.cell
-def _(Nper, V, avg_delays, mo, np, pyFDN):
+def _(ArrayLike, np):
+    def match_delay_totals_to_volumes(base_delays: ArrayLike, lines_per_group:int, volumes:ArrayLike, target_total=None):
+        """Match integer volume ratios exactly, retaining each group's delay spread.
+
+        Start from independently sampled coprime delays, then apportion integer
+        lengths to exact group totals. No coprimality constraint is imposed on
+        the result. Its total number of cells stays close to the original total.
+        Supply target_total to choose the nearest feasible total to a requested
+        global mean instead of retaining the original sampled total.
+        """
+        volumes = np.asarray(volumes, dtype=float)
+        integer_volumes = np.rint(volumes).astype(np.int64)
+        if np.any(volumes <= 0) or not np.allclose(volumes, integer_volumes):
+            raise ValueError("Exact-ratio comparison requires positive integer volumes.")
+        weights = integer_volumes // np.gcd.reduce(integer_volumes)
+        base = np.asarray(base_delays, dtype=np.int64).reshape(
+            len(volumes), lines_per_group)
+        state_count = base.sum() if target_total is None else target_total
+        multiplier = max(
+            int(np.rint(state_count / weights.sum())),
+            int(np.max(np.ceil(lines_per_group / weights))),
+        )
+        targets = multiplier * weights
+        matched = []
+        for group, target in zip(base, targets):
+            # Reserve one cell per line, then use largest-remainder rounding.
+            ideal = 1 + (target - lines_per_group) * group / group.sum()
+            lengths = np.floor(ideal).astype(np.int64)
+            remainder = int(target - lengths.sum())
+            order = np.argsort(-(ideal - lengths), kind="stable")
+            lengths[order[:remainder]] += 1
+            matched.append(lengths)
+        return np.concatenate(matched)
+
+    return (match_delay_totals_to_volumes,)
+
+
+@app.cell
+def _(Nper, V, avg_delays, match_delay_totals_to_volumes, mo, np, pyFDN):
     # --- Geometry: equal N per room, M_i proportional to V_i -------------------
     fs = 48000
     Nroom = Nper.value
@@ -169,10 +208,12 @@ def _(Nper, V, avg_delays, mo, np, pyFDN):
         N1, (int(M_avg * 0.5 * gscale), int(M_avg * 1.5 * gscale)),
         coprime=True,
         rng=331)
-    delays = np.concatenate([d1, d2]).astype(int)
+    co_prime_delays = np.concatenate([d1, d2]).astype(int)
+    delays = match_delay_totals_to_volumes(co_prime_delays, Nroom, V)
+
     delays_per_fdn = np.asarray([delays[:N1], delays[N1:]], dtype=np.int32)
     M1, M2 = int(d1.sum()), int(d2.sum())
-    M = [M1, M2]
+    _delay_totals = [M1, M2]
     ratio_mismatch = (V[0] / V[1]) / (M1 / M2)
 
     k1 = Nroom / np.sum(delays[:N1])
@@ -186,11 +227,11 @@ def _(Nper, V, avg_delays, mo, np, pyFDN):
     | | room 1 | room 2 |
     |---|---|---|
     | $N_i$ | {N1} | {N2} |
-    | $M_i$ | {M[0]} | {M[1]} |
+    | $M_i$ | {_delay_totals[0]} | {_delay_totals[1]} |
     | Ratio mismatch| {ratio_mismatch:.4f} |
     | $\Delta t_i=M_i/(N_if_s)$ | {dt_i[0]*1000:.3f} ms | {dt_i[1]*1000:.3f} ms | 
     """)
-    return N1, N2, Ntot, delays, delays_per_fdn, dt_i, fs, ratio_mismatch
+    return N1, N2, Ntot, delays, delays_per_fdn, dt_i, fs
 
 
 @app.cell
@@ -243,19 +284,17 @@ def _(
 def _(
     N1,
     N2,
-    Ntot,
     R_room,
-    TimeVaryingMatrix,
     block_diag,
     delays_per_fdn,
     fs,
     gamma,
     get_decay_matrix,
     get_feedback_matrix,
+    get_room_time_varying_matrix,
     mo,
     np,
     pyFDN,
-    ratio_mismatch,
 ):
     # --- Lift into the full GFDN feedback matrix --------------------------------
     np.random.seed(12343)
@@ -263,29 +302,39 @@ def _(
     modulation_frequency = 1.0  # hz
     modulation_amplitude = 3.0
     spread = 0.3
-    tv_matrix = TimeVaryingMatrix(Ntot, modulation_frequency,
-                                  modulation_amplitude, fs, spread)
+    # TV matrix gives us \Phi R(n) \Phi^\top
+    tv_matrix = get_room_time_varying_matrix(
+        R_room, N1, modulation_frequency, modulation_amplitude, fs, spread)
 
-    Qblocks = block_diag(pyFDN.random_orthogonal(N1),
-                         pyFDN.random_orthogonal(N2))
+    # M contains the static, orthogonal internal room mixers.
+    M = block_diag(pyFDN.random_orthogonal(N1),
+                   pyFDN.random_orthogonal(N2))
 
-    def compensating_matrix():
-        rho = np.sqrt(ratio_mismatch)
-        return block_diag(rho * np.eye(N1), np.eye(N2))
+    # G contains per-line amplitude absorption, NOT the room-rate matrix gamma.
+    # Its diagonal entries are exp(-gamma_i * m_ij / (2 * fs)).
+    G = get_decay_matrix(gamma, delays_per_fdn, fs)
+    F = np.kron(R_room, np.eye(N1))
 
-    Gamma = get_decay_matrix(gamma, delays_per_fdn, fs)
-    D = compensating_matrix()
-
-    A = get_feedback_matrix(R_room, Qblocks, N1)
-    A_lossy = A @ Gamma
+    # with time variance, we get the feedback matrix U(n) = \Phi R(n) \Phi^\top \Phi M G = \Phi R(n) M G
+    A = get_feedback_matrix(R_room, M, N1)  # \Phi @ M
+    A_lossy = A @ G                       # \Phi @ M @ G
     _ok = pyFDN.is_unilossless(A)
 
     mo.md(rf"""
-    ## 3 · The two GFDN feedback matrices
+    ## 3 · Fixed coupling, time-varying room mixers
 
-    Same internal room mixers $\mathbf Q_1,\mathbf Q_2$ for both — only the room‑coupling
-    $\mathbf R_{{\rm room}}$ differs. `is_unilossless`: = **{_ok}**
-    (both should be `True` — pure exchange, no absorption).
+    The code constructs $F=\Phi\otimes I_K$ from `R_room`, and
+    $M=\operatorname{{blkdiag}}(M_1,M_2)$ from the random orthogonal room mixers.
+    The diagonal matrix $G$ contains the per-line **amplitude** absorption:
+    $G_{{jj}}=\exp(-\gamma_i m_j/(2f_s))$ for a line in room $i$.
+    Lossless feedback is `A = F @ M`; lossy feedback is `A_lossy = \tilde{{\Phi}} @ M @ G`.
+
+    `get_room_time_varying_matrix` returns the runtime hook
+    $H(n)=\tilde{{\Phi}} R(n) \tilde{{\Phi}}^\top$, where $R(n)=\operatorname{{blkdiag}}(R_1(n),R_2(n))$.
+    `process_fdn` applies this hook **after** the static feedback matrix, giving
+    $H(n)A_{{\rm lossy}}=\tilde{{\Phi}} R(n)M G$.
+    Thus $M_i(n)=R_i(n)M_i$ varies, while $\Phi$ stays fixed. For the lossless
+    case, use $G=I$. `is_unilossless(A)` = **{_ok}**.
     """)
     return A, A_lossy, tv_matrix
 
@@ -294,6 +343,7 @@ def _(
 def _(
     A,
     A_lossy,
+    FDNBuild,
     N1,
     N2,
     Ntot,
@@ -303,10 +353,10 @@ def _(
     gfdn_energy_ledger,
     np,
     num_rooms,
-    run_gfdn,
+    pyFDN,
     tv_matrix,
 ):
-    # --- Impulse responses + exact per-room energy ledger, all rooms excited equally -----
+    # Render one unit impulse per source room through the time-domain processor.
     n_samp = int(dur.value * fs)
     B = np.zeros((Ntot, num_rooms))
     B[:N1, 0] = 1.0 / np.sqrt(N1)
@@ -314,35 +364,51 @@ def _(
 
     # output taken from all rooms
     C_lines = np.eye(Ntot)
-    Y = run_gfdn(A,
-                 B,
-                 C_lines,
-                 delays,
-                 n_samp,
-                 src=[0, 1],
-                 tv_matrix=tv_matrix
-                )
-    Y_lossy = run_gfdn(A_lossy,
-                       B,
-                       C_lines,
-                       delays,
-                       n_samp,
-                       src=[0, 1],
-                       tv_matrix=tv_matrix
-                      )
+    lossless_build = FDNBuild(
+        A=A, B=B, C=C_lines, D=np.zeros((Ntot, num_rooms)),
+        delays=delays, fs=fs, post_matrix=tv_matrix)
+    lossy_build = FDNBuild(
+        A=A_lossy, B=B, C=C_lines, D=np.zeros((Ntot, num_rooms)),
+        delays=delays, fs=fs, post_matrix=tv_matrix)
+    Y = np.zeros((num_rooms, n_samp, Ntot))
+    Y_lossy = np.zeros_like(Y)
+    for _build, _responses in ((lossless_build, Y), (lossy_build, Y_lossy)):
+        for _source in range(num_rooms):
+            _input = np.zeros((n_samp, num_rooms))
+            _input[0, _source] = 1.0
+            # The builds share a stateful hook: rewind it for every independent
+            # render so source rooms and lossless/lossy cases use the same clock.
+            tv_matrix.reset()
+            _responses[_source] = pyFDN.process_fdn(_input, _build)
 
     E_ex, n_ex = gfdn_energy_ledger(Y, num_rooms, N1, delays)
     E_ex_lossy, _ = gfdn_energy_ledger(Y_lossy, num_rooms, N1, delays)
     return E_ex, E_ex_lossy, Y, Y_lossy, n_ex, n_samp
 
 
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md("""
+    To process audio instead of an impulse, pass an array `x` with two columns
+    (one input per source room) to `pyFDN.process_fdn(x, lossy_build)` or
+    `pyFDN.process_fdn(x, lossless_build)`. Call `tv_matrix.reset()` first for a
+    new independent recording. Append zeros to `x` to render the reverberation
+    tail; the modulation clock continues through those zeros.
+
+    `M` and `G` are already included in each build's static `A`. The hook only
+    inserts the room rotations at the correct point; do not multiply by `M`
+    or `G` a second time. Set `post_matrix=None` to render fixed feedback.
+    """)
+    return
+
+
 @app.cell
 def _(Q, fs, gamma, n_samp, np, num_rooms, trajectory):
     # --- True physical trajectory e(t) = expm(Q t) e(0), source = room 1 -------
     tsec = np.arange(n_samp) / fs
-    _, Eref = trajectory(Q, np.array([1.0, 0.0]), np.eye(num_rooms), fs, n_samp)
+    _, Eref = trajectory(Q, np.array([0.0, 1.0]), np.eye(num_rooms), fs, n_samp)
     _, Eref_lossy = trajectory(Q,
-                               np.array([1.0, 0.0]),
+                               np.array([0.0, 1.0]),
                                np.eye(num_rooms),
                                fs,
                                n_samp,
@@ -377,10 +443,10 @@ def _(
 
     for _ax, _Eex, _Eref, _title in zip(_axs, [E_ex, db(E_ex_lossy)],
                                         [Eref, db(Eref_lossy)],
-                                        ["Lossless, src = R1", "Lossy, src = R1"]):
+                                        ["Lossless, src = R2", "Lossy, src = R2"]):
         for _r in range(num_rooms):
             _ax.plot(tsec[:n_ex],
-                     _Eex[0, :, _r],
+                     _Eex[1, :, _r],
                      color=_colors[_r],
                      lw=1.1,
                      label=f"GFDN {_labels[_r]}")
@@ -483,15 +549,15 @@ def _(N1, Y, Y_lossy, mo, np, num_rooms, plt, tsec):
             _ax.set_title(f"source room {_src+1} → receiver room {_rec+1}",
                           fontsize=9)
     for _ax in _axs[-1]:
-        _ax.set_xlabel("time (ms)")
+        _ax.set_xlabel("time (ms)", fontsize=10)
     for _ax in _axs[:, 0]:
-        _ax.set_ylabel("$h(t)$")
+        _ax.set_ylabel("$h(t)$", fontsize=10)
     _ymax = np.abs(h_mic[:, :_nmax]).max()
     _axs[0, 0].set_ylim(-_ymax, _ymax)
     _axs[0, 0].legend(['Lossless', 'Lossy'])
-    _fig.suptitle("Four lossless + lossy impulse responses (first %.0f ms)" %
-                  (_tmax * 1000),
-                  fontsize=10)
+    # _fig.suptitle("Four lossless + lossy impulse responses (first %.0f ms)" %
+    #               (_tmax * 1000),
+    #               fontsize=10)
     _fig.tight_layout()
     mo.mpl.interactive(_fig)
     return h_mic, h_mic_lossy
