@@ -288,18 +288,20 @@ def get_room_time_varying_matrix(
     if np.iscomplexobj(R_room):
         raise ValueError("R_room must be a real orthogonal matrix")
     coupling = np.asarray(R_room, dtype=float)
-    if coupling.ndim != 2 or coupling.shape[0] == 0 or coupling.shape[0] != coupling.shape[1]:
+    if coupling.ndim != 2 or coupling.shape[0] == 0 or coupling.shape[
+            0] != coupling.shape[1]:
         raise ValueError("R_room must be a non-empty square matrix")
     if not np.all(np.isfinite(coupling)) or not np.allclose(
-        coupling.T @ coupling, np.eye(len(coupling)), rtol=0, atol=1e-10
-    ):
+            coupling.T @ coupling, np.eye(len(coupling)), rtol=0, atol=1e-10):
         raise ValueError("R_room must be a real orthogonal matrix")
     if (isinstance(Nroom, (bool, np.bool_))
-            or not isinstance(Nroom, (int, np.integer))
-            or Nroom <= 0 or Nroom % 2):
+            or not isinstance(Nroom,
+                              (int, np.integer)) or Nroom <= 0 or Nroom % 2):
         raise ValueError("Nroom must be a positive even integer")
-    if not np.all(np.isfinite([cycles_per_second, amplitude, fs, spread])) or fs <= 0:
-        raise ValueError("Modulation parameters must be finite and fs must be positive")
+    if not np.all(np.isfinite([cycles_per_second, amplitude, fs, spread
+                               ])) or fs <= 0:
+        raise ValueError(
+            "Modulation parameters must be finite and fs must be positive")
 
     coupling_lift = np.kron(coupling, np.eye(Nroom))
     rotation = TimeVaryingMatrix(

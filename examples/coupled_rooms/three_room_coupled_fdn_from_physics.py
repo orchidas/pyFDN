@@ -501,7 +501,7 @@ def _(
     E_ex_chain,
     E_ex_chain_lossy,
     Eref_chain,
-    Eref_complete_lossy,
+    Eref_chain_lossy,
     V,
     fs,
     mo,
@@ -524,7 +524,7 @@ def _(
         return 10 * _tmp if is_energy_signal else 20 * _tmp
 
     for _ax, _Eex, _Eref, _title in zip(
-            _axs, [E_ex_chain, db(E_ex_chain_lossy)], [Eref_chain, db(Eref_complete_lossy)],
+            _axs, [E_ex_chain, db(E_ex_chain_lossy)], [Eref_chain, db(Eref_chain_lossy)],
         ["lossless chained (1–2, 2–3)", "lossy chained"]):
         for _r in range(num_rooms):
             _ax.plot(tsec[:n_ex],
